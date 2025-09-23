@@ -226,7 +226,7 @@ fn index_documents<D: Document>(
 }
 
 /// `doc_opstamps` is required to be non-empty.
-fn apply_deletes(
+pub fn apply_deletes(
     segment: &Segment,
     delete_cursor: &mut DeleteCursor,
     doc_opstamps: &[Opstamp],

@@ -1,7 +1,6 @@
 #![doc(html_logo_url = "http://fulmicoton.com/tantivy-logo/tantivy-logo.png")]
 #![cfg_attr(all(feature = "unstable", test), feature(test))]
 #![doc(test(attr(allow(unused_variables), deny(warnings))))]
-#![warn(missing_docs)]
 #![allow(
     clippy::len_without_is_empty,
     clippy::derive_partial_eq_without_eq,
@@ -223,7 +222,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
 pub use self::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
-pub use crate::core::{json_utils, Executor, Searcher, SearcherGeneration};
+pub use crate::core::{json_utils, Executor, Searcher, SearcherGeneration, META_FILEPATH};
 pub use crate::directory::Directory;
 pub use crate::index::{
     Index, IndexBuilder, IndexMeta, IndexSettings, IndexSortByField, InvertedIndexReader, Order,
