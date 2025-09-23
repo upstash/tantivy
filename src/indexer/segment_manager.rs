@@ -9,13 +9,13 @@ use crate::indexer::delete_queue::DeleteCursor;
 use crate::indexer::SegmentEntry;
 
 #[derive(Default)]
-struct SegmentRegisters {
+pub struct SegmentRegisters {
     uncommitted: SegmentRegister,
     committed: SegmentRegister,
 }
 
 #[derive(PartialEq, Eq)]
-pub(crate) enum SegmentsStatus {
+pub enum SegmentsStatus {
     Committed,
     Uncommitted,
 }
