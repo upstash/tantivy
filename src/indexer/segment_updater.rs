@@ -35,7 +35,7 @@ const PANIC_CAUGHT: &str = "Panic caught in merge thread";
 /// - it success, and `meta.json` is written and flushed.
 ///
 /// This method is not part of tantivy's public API
-pub(crate) fn save_metas(metas: &IndexMeta, directory: &dyn Directory) -> crate::Result<()> {
+pub fn save_metas(metas: &IndexMeta, directory: &dyn Directory) -> crate::Result<()> {
     info!("save metas");
     let mut buffer = serde_json::to_vec_pretty(metas)?;
     // Just adding a new line at the end of the buffer.
@@ -84,7 +84,7 @@ fn garbage_collect_files(
 
 /// Merges a list of segments the list of segment givens in the `segment_entries`.
 /// This function happens in the calling thread and is computationally expensive.
-fn merge(
+pub fn merge(
     index: &Index,
     mut segment_entries: Vec<SegmentEntry>,
     target_opstamp: Opstamp,
