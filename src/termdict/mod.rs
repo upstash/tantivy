@@ -42,9 +42,9 @@ use tantivy_fst::Automaton;
 
 use self::termdict::{
     TermDictionary as InnerTermDict, TermDictionaryBuilder as InnerTermDictBuilder,
-    TermStreamerBuilder,
+    TermStreamerBuilder, TermStreamerBuilderWithState,
 };
-pub use self::termdict::{TermMerger, TermStreamer};
+pub use self::termdict::{TermMerger, TermStreamer, TermStreamerWithState};
 use crate::postings::TermInfo;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -154,6 +154,19 @@ impl TermDictionary {
     pub fn search<'a, A: Automaton + 'a>(&'a self, automaton: A) -> TermStreamerBuilder<'a, A>
     where A::State: Clone {
         self.0.search(automaton)
+    }
+
+    /// Returns a search builder that includes automaton state information.
+    /// This is useful for computing scores based on automaton properties
+    /// (e.g., Levenshtein distance for fuzzy queries).
+    pub fn search_with_state<'a, A: Automaton + 'a>(
+        &'a self,
+        automaton: A,
+    ) -> TermStreamerBuilderWithState<'a, A>
+    where
+        A::State: Clone,
+    {
+        self.0.search_with_state(automaton)
     }
 
     #[cfg(feature = "quickwit")]
