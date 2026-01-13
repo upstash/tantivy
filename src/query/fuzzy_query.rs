@@ -1,10 +1,16 @@
+use common::BitSet;
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA};
 use once_cell::sync::OnceCell;
 use tantivy_fst::Automaton;
 
-use crate::query::{AutomatonWeight, EnableScoring, Query, Weight};
-use crate::schema::{Term, Type};
+use crate::index::SegmentReader;
+use crate::query::phrase_prefix_query::prefix_end;
+use crate::query::{
+    AutomatonWeight, BitSetDocSet, EnableScoring, Explanation, Query, Scorer, Weight,
+};
+use crate::schema::{Field, IndexRecordOption, Term, Type};
 use crate::TantivyError::InvalidArgument;
+use crate::{DocId, DocSet, Score, TantivyError};
 
 /// The Levenshtein automaton a [`FuzzyTermQuery`] matches terms with.
 ///
@@ -194,8 +200,117 @@ impl FuzzyTermQuery {
 }
 
 impl Query for FuzzyTermQuery {
-    fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        Ok(Box::new(self.specialized_weight()?))
+    fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        if !enable_scoring.is_scoring_enabled() {
+            return Ok(Box::new(self.specialized_weight()?));
+        }
+        let json_path_bytes = self
+            .term
+            .value()
+            .as_json()
+            .map(|(json_path_bytes, _)| json_path_bytes.to_vec().into_boxed_slice());
+        Ok(Box::new(FuzzyTermWeight {
+            field: self.term.field(),
+            automaton: self.automaton()?,
+            json_path_bytes,
+        }))
+    }
+}
+
+/// The weight of a [`FuzzyTermQuery`] with scoring enabled. A document scores
+/// `boost / (1 + distance)`, where `distance` is the smallest Levenshtein distance among its
+/// matching terms.
+struct FuzzyTermWeight {
+    field: Field,
+    automaton: DfaWrapper,
+    json_path_bytes: Option<Box<[u8]>>,
+}
+
+impl Weight for FuzzyTermWeight {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
+        let max_doc = reader.max_doc();
+        let mut matching_docs = BitSet::with_max_value(max_doc);
+        let mut distance_plus_one = vec![0u8; max_doc as usize];
+        let inverted_index = reader.inverted_index(self.field)?;
+        let mut term_stream_builder = inverted_index.terms().search_with_state(&self.automaton);
+        if let Some(json_path_bytes) = &self.json_path_bytes {
+            term_stream_builder = term_stream_builder.ge(json_path_bytes);
+            if let Some(end) = prefix_end(json_path_bytes) {
+                term_stream_builder = term_stream_builder.lt(&end);
+            }
+        }
+        let mut term_stream = term_stream_builder.into_stream()?;
+        while let Some((_, term_info, state)) = term_stream.next() {
+            let term_distance_plus_one = self.automaton.0.distance(*state).to_u8() + 1;
+            let mut block_segment_postings = inverted_index
+                .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
+            loop {
+                let docs = block_segment_postings.docs();
+                if docs.is_empty() {
+                    break;
+                }
+                for &doc in docs {
+                    matching_docs.insert(doc);
+                    let doc_distance_plus_one = &mut distance_plus_one[doc as usize];
+                    if *doc_distance_plus_one == 0
+                        || term_distance_plus_one < *doc_distance_plus_one
+                    {
+                        *doc_distance_plus_one = term_distance_plus_one;
+                    }
+                }
+                block_segment_postings.advance();
+            }
+        }
+        Ok(Box::new(FuzzyTermScorer {
+            matching_docs: BitSetDocSet::from(matching_docs),
+            distance_plus_one,
+            boost,
+        }))
+    }
+
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
+        let mut scorer = self.scorer(reader, 1.0)?;
+        if scorer.seek(doc) == doc {
+            Ok(Explanation::new("FuzzyTermScorer", scorer.score()))
+        } else {
+            Err(TantivyError::InvalidArgument(
+                "Document does not exist".to_string(),
+            ))
+        }
+    }
+}
+
+struct FuzzyTermScorer {
+    matching_docs: BitSetDocSet,
+    /// Per document, one more than the smallest distance among its matching terms, and 0 for a
+    /// document without a matching term. A zeroed vector allocates lazily, so only the pages of
+    /// matching documents are touched.
+    distance_plus_one: Vec<u8>,
+    boost: Score,
+}
+
+impl DocSet for FuzzyTermScorer {
+    fn advance(&mut self) -> DocId {
+        self.matching_docs.advance()
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        self.matching_docs.seek(target)
+    }
+
+    fn doc(&self) -> DocId {
+        self.matching_docs.doc()
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.matching_docs.size_hint()
+    }
+}
+
+impl Scorer for FuzzyTermScorer {
+    fn score(&mut self) -> Score {
+        let doc = self.matching_docs.doc();
+        self.boost / self.distance_plus_one[doc as usize] as Score
     }
 }
 
@@ -335,6 +450,7 @@ mod test {
         let searcher = reader.searcher();
 
         // passes because Levenshtein distance is 1 (substitute 'o' with 'a')
+        // Score should be 1.0 / (1.0 + 1) = 0.5
         {
             let term = Term::from_field_text(country_field, "japon");
             let fuzzy_query = FuzzyTermQuery::new(term, 1, true);
@@ -342,7 +458,7 @@ mod test {
                 searcher.search(&fuzzy_query, &TopDocs::with_limit(2).order_by_score())?;
             assert_eq!(top_docs.len(), 1, "Expected only 1 document");
             let (score, _) = top_docs[0];
-            assert_nearly_equals!(1.0, score);
+            assert_nearly_equals!(0.5, score);
         }
 
         // fails because non-prefix Levenshtein distance is more than 1 (add 'a' and 'n')
@@ -390,6 +506,122 @@ mod test {
             let count = searcher.search(&fuzzy_query_transposition, &Count)?;
             assert_eq!(count, 0);
         }
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_fuzzy_scoring_ranks_exact_matches_higher() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let word_field = schema_builder.add_text_field("word", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            // Add exact match (doc_id=0)
+            index_writer.add_document(doc!(word_field => "hello"))?;
+            // Add distance-1 match (doc_id=1): e→a substitution
+            index_writer.add_document(doc!(word_field => "hallo"))?;
+            // Add distance-2 match (doc_id=2): e→i and l→o (two substitutions)
+            index_writer.add_document(doc!(word_field => "hiloo"))?;
+            index_writer.commit()?;
+        }
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        // Search for "hello" with distance 2
+        let term = Term::from_field_text(word_field, "hello");
+        let fuzzy_query = FuzzyTermQuery::new(term, 2, true);
+        let top_docs = searcher.search(&fuzzy_query, &TopDocs::with_limit(10).order_by_score())?;
+
+        assert_eq!(top_docs.len(), 3);
+
+        // Verify scores:
+        // - "hello" (exact, distance 0): 1.0 / (1 + 0) = 1.0
+        // - "hallo" (distance 1): 1.0 / (1 + 1) = 0.5
+        // - "hiloo" (distance 2): 1.0 / (1 + 2) = 0.333...
+
+        // First result should be exact match with score 1.0
+        let (score_0, doc_addr_0) = top_docs[0];
+        assert_nearly_equals!(1.0, score_0);
+        assert_eq!(doc_addr_0.doc_id, 0);
+
+        // Second should be distance-1 match with score 0.5
+        let (score_1, doc_addr_1) = top_docs[1];
+        assert_nearly_equals!(0.5, score_1);
+        assert_eq!(doc_addr_1.doc_id, 1);
+
+        // Third should be distance-2 match with score ~0.333
+        let (score_2, doc_addr_2) = top_docs[2];
+        assert_nearly_equals!(1.0 / 3.0, score_2);
+        assert_eq!(doc_addr_2.doc_id, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_fuzzy_prefix_scoring_ranks_exact_matches_higher() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let word_field = schema_builder.add_text_field("word", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            // Add exact match (doc_id=0)
+            index_writer.add_document(doc!(word_field => "hello"))?;
+            // Add distance-1 match (doc_id=1): e→a substitution
+            index_writer.add_document(doc!(word_field => "hallo"))?;
+            // Add distance-2 match (doc_id=2): e→i and l→o (two substitutions)
+            index_writer.add_document(doc!(word_field => "hiooo"))?;
+            index_writer.commit()?;
+        }
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        // Search for "hel" with distance 1, with prefix
+        let term = Term::from_field_text(word_field, "hel");
+        let fuzzy_query = FuzzyTermQuery::new_prefix(term, 1, true);
+        let top_docs = searcher.search(&fuzzy_query, &TopDocs::with_limit(10).order_by_score())?;
+
+        assert_eq!(top_docs.len(), 2);
+
+        // Verify scores:
+        // - "hel...lo" (exact, distance 0): 1.0 / (1 + 0) = 1.0
+        // - "hal...lo" (distance 1): 1.0 / (1 + 1) = 0.5
+        // - "hio...oo" (distance 2): no-match
+
+        // First result should be exact match with score 1.0
+        let (score_0, doc_addr_0) = top_docs[0];
+        assert_nearly_equals!(1.0, score_0);
+        assert_eq!(doc_addr_0.doc_id, 0);
+
+        // Second should be distance-1 match with score 0.5
+        let (score_1, doc_addr_1) = top_docs[1];
+        assert_nearly_equals!(0.5, score_1);
+        assert_eq!(doc_addr_1.doc_id, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_fuzzy_scoring_uses_closest_term_of_document() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let word_field = schema_builder.add_text_field("word", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.add_document(doc!(word_field => "hallo hello"))?;
+        index_writer.add_document(doc!(word_field => "hallo"))?;
+        index_writer.commit()?;
+        let searcher = index.reader()?.searcher();
+
+        let fuzzy_query = FuzzyTermQuery::new(Term::from_field_text(word_field, "hello"), 1, true);
+        let top_docs = searcher.search(&fuzzy_query, &TopDocs::with_limit(10).order_by_score())?;
+
+        assert_eq!(top_docs.len(), 2);
+        assert_nearly_equals!(1.0, top_docs[0].0);
+        assert_eq!(top_docs[0].1.doc_id, 0);
+        assert_nearly_equals!(0.5, top_docs[1].0);
+        assert_eq!(top_docs[1].1.doc_id, 1);
+        assert_eq!(searcher.search(&fuzzy_query, &Count)?, 2);
         Ok(())
     }
 }

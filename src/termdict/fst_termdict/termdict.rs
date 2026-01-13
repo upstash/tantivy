@@ -7,7 +7,7 @@ use tantivy_fst::raw::Fst;
 use tantivy_fst::Automaton;
 
 use super::term_info_store::{TermInfoStore, TermInfoStoreWriter};
-use super::{TermStreamer, TermStreamerBuilder};
+use super::{TermStreamer, TermStreamerBuilder, TermStreamerBuilderWithState};
 use crate::directory::{FileSlice, OwnedBytes};
 use crate::postings::TermInfo;
 use crate::termdict::TermOrdinal;
@@ -217,5 +217,19 @@ impl TermDictionary {
     pub fn search<'a, A: Automaton + 'a>(&'a self, automaton: A) -> TermStreamerBuilder<'a, A> {
         let stream_builder = self.fst_index.search(automaton);
         TermStreamerBuilder::<A>::new(self, stream_builder)
+    }
+
+    /// Returns a search builder that includes automaton state information.
+    /// This is useful for computing scores based on automaton properties
+    /// (e.g., Levenshtein distance for fuzzy queries).
+    pub fn search_with_state<'a, A: Automaton + 'a>(
+        &'a self,
+        automaton: A,
+    ) -> TermStreamerBuilderWithState<'a, A>
+    where
+        A::State: Clone,
+    {
+        let stream_builder = self.fst_index.search(automaton);
+        TermStreamerBuilderWithState::<A>::new(self, stream_builder)
     }
 }
