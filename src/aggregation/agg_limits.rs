@@ -88,6 +88,20 @@ impl AggregationLimitsGuard {
         }
     }
 
+    pub fn validate_current_memory_consumption(&self) -> crate::Result<()> {
+        let consumed = self.memory_consumption.load(Ordering::Relaxed);
+        if consumed > self.memory_limit.get_bytes() {
+            return Err(crate::TantivyError::AggregationError(
+                AggregationError::MemoryAlreadyExceeded {
+                    limit: self.memory_limit,
+                    current: consumed.into(),
+                },
+            ));
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn add_memory_consumed(&mut self, add_num_bytes: u64) -> crate::Result<()> {
         let prev_value = self
             .memory_consumption

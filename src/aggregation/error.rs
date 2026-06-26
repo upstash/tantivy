@@ -36,4 +36,13 @@ pub enum AggregationError {
         /// Current num buckets
         current: u32,
     },
+    #[error(
+        "Aborting aggregation because memory limit was exceeded before aggregation is executed"
+    )]
+    MemoryAlreadyExceeded {
+        /// Memory consumption limit
+        limit: ByteCount,
+        /// Current memory consumption
+        current: ByteCount,
+    },
 }
