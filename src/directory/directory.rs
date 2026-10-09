@@ -180,6 +180,13 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// effectively stored durably.
     fn sync_directory(&self) -> io::Result<()>;
 
+    /// Returns false for a file that a [`ManagedDirectory`](crate::directory::ManagedDirectory)
+    /// over this directory must not register in `.managed.json`.
+    /// `ManagedDirectory::garbage_collect` never deletes such a file, so its owner must.
+    fn is_managed_file(&self, _path: &Path) -> bool {
+        true
+    }
+
     /// Acquire a lock in the directory given in the [`Lock`].
     ///
     /// The method is blocking or not depending on the [`Lock`] object.

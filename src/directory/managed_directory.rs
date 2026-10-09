@@ -212,7 +212,7 @@ impl ManagedDirectory {
     /// to garbage collection.
     fn register_file_as_managed(&self, filepath: &Path) -> io::Result<()> {
         // Files starting by "." (e.g. lock files) are not managed.
-        if !is_managed(filepath) {
+        if !is_managed(filepath) || !self.directory.is_managed_file(filepath) {
             return Ok(());
         }
         let mut meta_wlock = self
@@ -323,6 +323,10 @@ impl Directory for ManagedDirectory {
         self.directory.sync_directory()?;
         Ok(())
     }
+
+    fn is_managed_file(&self, path: &Path) -> bool {
+        self.directory.is_managed_file(path)
+    }
 }
 
 impl Clone for ManagedDirectory {
@@ -331,6 +335,80 @@ impl Clone for ManagedDirectory {
             directory: self.directory.box_clone(),
             meta_informations: Arc::clone(&self.meta_informations),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use crate::core::MANAGED_FILEPATH;
+    use crate::directory::error::{DeleteError, OpenReadError, OpenWriteError};
+    use crate::directory::{
+        Directory, FileHandle, ManagedDirectory, RamDirectory, TerminatingWrite, WatchCallback,
+        WatchHandle, WritePtr,
+    };
+
+    #[derive(Clone, Debug)]
+    struct UnmanagedDirectory(RamDirectory);
+
+    impl Directory for UnmanagedDirectory {
+        fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+            self.0.get_file_handle(path)
+        }
+
+        fn delete(&self, path: &Path) -> Result<(), DeleteError> {
+            self.0.delete(path)
+        }
+
+        fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+            self.0.exists(path)
+        }
+
+        fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+            self.0.open_write(path)
+        }
+
+        fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+            self.0.atomic_read(path)
+        }
+
+        fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+            self.0.atomic_write(path, data)
+        }
+
+        fn sync_directory(&self) -> io::Result<()> {
+            self.0.sync_directory()
+        }
+
+        fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle> {
+            self.0.watch(watch_callback)
+        }
+
+        fn is_managed_file(&self, _path: &Path) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_unmanaged_files_are_not_registered() {
+        let ram_directory = RamDirectory::create();
+        let managed_directory =
+            ManagedDirectory::wrap(Box::new(UnmanagedDirectory(ram_directory.clone()))).unwrap();
+
+        let write_file = managed_directory
+            .open_write(Path::new("segment.idx"))
+            .unwrap();
+        write_file.terminate().unwrap();
+        managed_directory
+            .atomic_write(Path::new("meta.json"), b"{}")
+            .unwrap();
+
+        assert!(ram_directory.exists(Path::new("segment.idx")).unwrap());
+        assert!(!ram_directory.exists(&MANAGED_FILEPATH).unwrap());
+        assert!(managed_directory.list_managed_files().is_empty());
     }
 }
 

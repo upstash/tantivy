@@ -95,6 +95,7 @@ impl IndexMerger {
             .any(|doc_id| col.first(doc_id).is_none())
     }
 
+    #[cfg(all(test, feature = "unstable"))]
     pub fn open(
         schema: Schema,
         index_settings: IndexSettings,

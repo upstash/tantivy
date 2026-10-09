@@ -147,6 +147,20 @@ impl SegmentReader {
         StoreReader::open(self.store_file.clone(), cache_num_blocks)
     }
 
+    /// Returns a reader that shares every component with `self`, with `alive_bitset` as its
+    /// whole alive set. The `.del` file of the segment is not read again, so `alive_bitset`
+    /// must already exclude the documents it deletes.
+    pub fn with_alive_bitset(&self, alive_bitset: Option<AliveBitSet>) -> SegmentReader {
+        let num_docs = match &alive_bitset {
+            Some(alive_bitset) => alive_bitset.num_alive_docs() as u32,
+            None => self.max_doc,
+        };
+        let mut segment_reader = self.clone();
+        segment_reader.alive_bitset_opt = alive_bitset;
+        segment_reader.num_docs = num_docs;
+        segment_reader
+    }
+
     /// Open a new segment for reading.
     pub fn open(segment: &Segment) -> crate::Result<SegmentReader> {
         Self::open_with_custom_alive_set(segment, None)

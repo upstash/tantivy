@@ -74,11 +74,6 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             index.settings_mut().manual_doc_id_mapping = false;
         }
 
-        if did_remapping {
-            // Untrack the temp docstore file from the segment metadata.
-            segment_meta.untrack_temp_docstore();
-        }
-
         let persisted_custom_extensions: Vec<String> = index
             .custom_plugins()
             .iter()

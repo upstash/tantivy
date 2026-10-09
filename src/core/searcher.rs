@@ -35,10 +35,8 @@ pub struct SearcherGeneration {
 }
 
 impl SearcherGeneration {
-    pub(crate) fn from_segment_readers(
-        segment_readers: &[SegmentReader],
-        generation_id: u64,
-    ) -> Self {
+    /// Builds the generation of a searcher over the given segment readers.
+    pub fn from_segment_readers(segment_readers: &[SegmentReader], generation_id: u64) -> Self {
         let mut segment_id_to_del_opstamp = BTreeMap::new();
         for segment_reader in segment_readers {
             segment_id_to_del_opstamp
@@ -246,6 +244,34 @@ impl Searcher {
     }
 }
 
+impl Searcher {
+    /// Builds a searcher over the given segment readers. `store_readers[i]` is the store reader
+    /// of `segment_readers[i]` to reuse, or `None` to open a new one.
+    pub fn from_segment_readers(
+        schema: Schema,
+        index: Index,
+        segment_readers: Vec<SegmentReader>,
+        store_readers: Vec<Option<Arc<StoreReader>>>,
+        generation: TrackedObject<SearcherGeneration>,
+        doc_store_cache_num_blocks: usize,
+    ) -> io::Result<Searcher> {
+        let inner = SearcherInner::with_store_readers(
+            schema,
+            index,
+            segment_readers,
+            store_readers,
+            generation,
+            doc_store_cache_num_blocks,
+        )?;
+        Ok(Arc::new(inner).into())
+    }
+
+    /// Returns the store readers, in the order of the segment readers.
+    pub fn store_readers(&self) -> &[Arc<StoreReader>] {
+        &self.inner.store_readers
+    }
+}
+
 impl From<Arc<SearcherInner>> for Searcher {
     fn from(inner: Arc<SearcherInner>) -> Self {
         Searcher { inner }
@@ -260,7 +286,7 @@ pub(crate) struct SearcherInner {
     schema: Schema,
     index: Index,
     segment_readers: Vec<SegmentReader>,
-    store_readers: Vec<StoreReader>,
+    store_readers: Vec<Arc<StoreReader>>,
     generation: TrackedObject<SearcherGeneration>,
 }
 
@@ -273,6 +299,25 @@ impl SearcherInner {
         generation: TrackedObject<SearcherGeneration>,
         doc_store_cache_num_blocks: usize,
     ) -> io::Result<SearcherInner> {
+        let store_readers = segment_readers.iter().map(|_| None).collect();
+        Self::with_store_readers(
+            schema,
+            index,
+            segment_readers,
+            store_readers,
+            generation,
+            doc_store_cache_num_blocks,
+        )
+    }
+
+    fn with_store_readers(
+        schema: Schema,
+        index: Index,
+        segment_readers: Vec<SegmentReader>,
+        store_readers: Vec<Option<Arc<StoreReader>>>,
+        generation: TrackedObject<SearcherGeneration>,
+        doc_store_cache_num_blocks: usize,
+    ) -> io::Result<SearcherInner> {
         assert_eq!(
             &segment_readers
                 .iter()
@@ -281,16 +326,22 @@ impl SearcherInner {
             generation.segments(),
             "Set of segments referenced by this Searcher and its SearcherGeneration must match"
         );
-        let store_readers: Vec<StoreReader> = segment_readers
-            .iter()
-            .map(|segment_reader| segment_reader.get_store_reader(doc_store_cache_num_blocks))
-            .collect::<io::Result<Vec<_>>>()?;
+        assert_eq!(segment_readers.len(), store_readers.len());
+        let mut opened_store_readers = Vec::with_capacity(segment_readers.len());
+        for (segment_reader, store_reader) in segment_readers.iter().zip(store_readers) {
+            match store_reader {
+                Some(store_reader) => opened_store_readers.push(store_reader),
+                None => opened_store_readers.push(Arc::new(
+                    segment_reader.get_store_reader(doc_store_cache_num_blocks)?,
+                )),
+            }
+        }
 
         Ok(SearcherInner {
             schema,
             index,
             segment_readers,
-            store_readers,
+            store_readers: opened_store_readers,
             generation,
         })
     }

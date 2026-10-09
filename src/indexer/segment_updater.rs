@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+use common::ReadOnlyBitSet;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use super::segment_manager::SegmentManager;
@@ -17,7 +18,7 @@ use crate::index::{
     list_segment_files, Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta,
 };
 use crate::indexer::delete_queue::DeleteCursor;
-use crate::indexer::index_writer::advance_deletes;
+use crate::indexer::index_writer::{advance_deletes, compute_alive_bitset};
 use crate::indexer::merge_operation::MergeOperationInventory;
 use crate::indexer::merger::IndexMerger;
 use crate::indexer::segment_manager::SegmentsStatus;
@@ -80,40 +81,54 @@ fn garbage_collect_files(
         .garbage_collect(move || segment_updater.list_files())
 }
 
-/// Merges a list of segments the list of segment givens in the `segment_entries`.
-/// This function happens in the calling thread and is computationally expensive.
+/// Merges the segments of `segment_entries` into one new segment. It runs in the calling thread
+/// and is computationally expensive.
+///
+/// The deletes of each input come from `compute_alive_bitset` and stay in memory, so the merged
+/// segment is the only file a merge writes. Opstamps after the last commit repeat after a
+/// restart, so a `.del` written here could collide with the `.del` of a later commit at the same
+/// opstamp.
+///
+/// No input may have applied a delete operation newer than `target_opstamp`. Then every cursor
+/// ends at the first operation after `target_opstamp`, and the merged entry takes the cursor of
+/// the first input.
 pub fn merge(
     index: &Index,
     mut segment_entries: Vec<SegmentEntry>,
     target_opstamp: Opstamp,
 ) -> crate::Result<Option<SegmentEntry>> {
-    let num_docs = segment_entries
-        .iter()
-        .map(|segment| segment.meta().num_docs() as u64)
-        .sum::<u64>();
+    let mut segments: Vec<Segment> = Vec::with_capacity(segment_entries.len());
+    let mut alive_bitsets: Vec<Option<AliveBitSet>> = Vec::with_capacity(segment_entries.len());
+    let mut num_docs: u64 = 0;
+    for segment_entry in &mut segment_entries {
+        let segment = index.segment(segment_entry.meta().clone());
+        match compute_alive_bitset(&segment, segment_entry, target_opstamp)? {
+            Some(alive_bitset) => {
+                num_docs += alive_bitset.len() as u64;
+                alive_bitsets.push(Some(AliveBitSet::from(ReadOnlyBitSet::from(&alive_bitset))));
+            }
+            None => {
+                num_docs += segment_entry.meta().num_docs() as u64;
+                alive_bitsets.push(None);
+            }
+        }
+        segments.push(segment);
+    }
     if num_docs == 0 {
         return Ok(None);
     }
 
-    // first we need to apply deletes to our segment.
     let merged_segment = index.new_segment();
-
-    // First we apply all of the delete to the merged segment, up to the target opstamp.
-    for segment_entry in &mut segment_entries {
-        let segment = index.segment(segment_entry.meta().clone());
-        advance_deletes(segment, segment_entry, target_opstamp)?;
-    }
 
     let delete_cursor = segment_entries[0].delete_cursor().clone();
 
-    let segments: Vec<Segment> = segment_entries
-        .iter()
-        .map(|segment_entry| index.segment(segment_entry.meta().clone()))
-        .collect();
-
     // An IndexMerger is like a "view" of our merged segments.
-    let merger: IndexMerger =
-        IndexMerger::open(index.schema(), index.settings().clone(), &segments[..])?;
+    let merger: IndexMerger = IndexMerger::open_with_custom_alive_set(
+        index.schema(),
+        index.settings().clone(),
+        &segments[..],
+        alive_bitsets,
+    )?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
     let num_docs = merger.write(&merged_segment)?;
@@ -724,17 +739,26 @@ impl SegmentUpdater {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_indices;
+    use std::path::Path;
+
+    use common::BitSet;
+
+    use super::{merge, merge_indices};
     use crate::collector::TopDocs;
     use crate::directory::RamDirectory;
     use crate::fastfield::AliveBitSet;
-    use crate::index::{SegmentId, SegmentMetaInventory};
+    use crate::index::{list_segment_files, SegmentId, SegmentMetaInventory};
+    use crate::indexer::delete_queue::DeleteQueue;
+    use crate::indexer::index_writer::compute_alive_bitset;
     use crate::indexer::merge_policy::tests::MergeWheneverPossible;
     use crate::indexer::merger::IndexMerger;
     use crate::indexer::segment_updater::merge_filtered_segments;
-    use crate::query::QueryParser;
+    use crate::indexer::{DeleteOperation, NoMergePolicy, SegmentEntry};
+    use crate::query::{EnableScoring, Query, QueryParser, TermQuery};
     use crate::schema::*;
-    use crate::{Directory, DocAddress, Index, Segment};
+    use crate::{
+        Directory, DocAddress, Index, IndexSettings, IndexSortByField, IndexWriter, Order, Segment,
+    };
 
     #[test]
     fn test_segment_sort_large_max_doc() {
@@ -750,6 +774,222 @@ mod tests {
         assert_eq!(metas[0].max_doc(), (1u32 << 31) - 1);
         assert_eq!(metas[1].max_doc(), 50_000);
         assert_eq!(metas[2].max_doc(), 100);
+    }
+
+    #[test]
+    fn test_merge_writes_no_delete_file() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.set_merge_policy(Box::new(NoMergePolicy));
+        index_writer.add_document(doc!(text_field=>"a"))?;
+        index_writer.add_document(doc!(text_field=>"b"))?;
+        index_writer.commit()?;
+        index_writer.add_document(doc!(text_field=>"c"))?;
+        index_writer.commit()?;
+        index_writer.wait_merging_threads()?;
+
+        let segment_metas = index.searchable_segment_metas()?;
+        assert_eq!(segment_metas.len(), 2);
+        let delete_queue = DeleteQueue::default();
+        let delete_cursor = delete_queue.cursor();
+        let mut segment_entries = Vec::new();
+        for segment_meta in segment_metas {
+            segment_entries.push(SegmentEntry::new(segment_meta, delete_cursor.clone(), None));
+        }
+        let target_opstamp = index.load_metas()?.opstamp + 1;
+        let term_query = TermQuery::new(
+            Term::from_field_text(text_field, "a"),
+            IndexRecordOption::Basic,
+        );
+        delete_queue.push(DeleteOperation {
+            opstamp: target_opstamp,
+            target: term_query.weight(EnableScoring::disabled_from_schema(&schema))?,
+        });
+        let files_before = index.directory().list_managed_files();
+
+        let merged_segment_entry = merge(&index, segment_entries, target_opstamp)?.unwrap();
+
+        assert_eq!(merged_segment_entry.meta().num_docs(), 2);
+        let mut new_files = index.directory().list_managed_files();
+        new_files.retain(|path| !files_before.contains(path));
+        assert_eq!(
+            new_files,
+            list_segment_files(std::slice::from_ref(merged_segment_entry.meta()), &[])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_files_names_only_existing_files() -> crate::Result<()> {
+        let sort_by_number = IndexSortByField {
+            field: "number".to_string(),
+            order: Order::Asc,
+        };
+        for sort_by_field in [None, Some(sort_by_number)] {
+            let mut schema_builder = Schema::builder();
+            let text_field = schema_builder.add_text_field("text", TEXT);
+            let number_field = schema_builder.add_u64_field("number", FAST);
+            let index = Index::builder()
+                .schema(schema_builder.build())
+                .settings(IndexSettings {
+                    sort_by_field,
+                    ..Default::default()
+                })
+                .create_in_ram()?;
+
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
+            index_writer.add_document(doc!(text_field=>"a", number_field=>2u64))?;
+            index_writer.add_document(doc!(text_field=>"b", number_field=>1u64))?;
+            index_writer.commit()?;
+            index_writer.add_document(doc!(text_field=>"c", number_field=>3u64))?;
+            index_writer.delete_term(Term::from_field_text(text_field, "a"));
+            index_writer.commit()?;
+            index_writer.garbage_collect_files().wait()?;
+
+            let segment_metas = index.searchable_segment_metas()?;
+            assert_eq!(segment_metas.len(), 2);
+            let mut with_deletes = 0;
+            for segment_meta in &segment_metas {
+                if segment_meta.has_deletes() {
+                    with_deletes += 1;
+                }
+            }
+            assert_eq!(with_deletes, 1);
+            let listed_files = list_segment_files(&index.list_all_segment_metas(), &[]);
+            let mut files = index.directory().list_managed_files();
+            files.remove(Path::new("meta.json"));
+            files.remove(Path::new(".managed.json"));
+            assert_eq!(listed_files, files);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_of_inputs_dead_in_memory() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.add_document(doc!(text_field=>"a"))?;
+        index_writer.commit()?;
+        index_writer.wait_merging_threads()?;
+
+        let segment_metas = index.searchable_segment_metas()?;
+        assert_eq!(segment_metas.len(), 1);
+        let segment_meta = segment_metas[0].clone();
+        let alive_bitset = BitSet::with_max_value(segment_meta.max_doc());
+        let segment_entry = SegmentEntry::new(
+            segment_meta,
+            DeleteQueue::default().cursor(),
+            Some(alive_bitset),
+        );
+
+        let merged_segment_entry = merge(&index, vec![segment_entry], index.load_metas()?.opstamp)?;
+
+        assert!(merged_segment_entry.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_compute_alive_bitset_is_none_without_deletes_beyond_delete_file() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.set_merge_policy(Box::new(NoMergePolicy));
+        index_writer.add_document(doc!(text_field=>"a"))?;
+        index_writer.add_document(doc!(text_field=>"b"))?;
+        index_writer.commit()?;
+        index_writer.delete_term(Term::from_field_text(text_field, "a"));
+        index_writer.commit()?;
+        index_writer.wait_merging_threads()?;
+
+        let segment_metas = index.searchable_segment_metas()?;
+        assert_eq!(segment_metas.len(), 1);
+        let segment_meta = segment_metas[0].clone();
+        assert_eq!(segment_meta.num_deleted_docs(), 1);
+        let segment = index.segment(segment_meta.clone());
+        let target_opstamp = index.load_metas()?.opstamp + 1;
+        let delete_queue = DeleteQueue::default();
+        let mut segment_entry =
+            SegmentEntry::new(segment_meta.clone(), delete_queue.cursor(), None);
+        let absent_term_query = TermQuery::new(
+            Term::from_field_text(text_field, "absent"),
+            IndexRecordOption::Basic,
+        );
+        delete_queue.push(DeleteOperation {
+            opstamp: target_opstamp,
+            target: absent_term_query.weight(EnableScoring::disabled_from_schema(&schema))?,
+        });
+        let b_term_query = TermQuery::new(
+            Term::from_field_text(text_field, "b"),
+            IndexRecordOption::Basic,
+        );
+        delete_queue.push(DeleteOperation {
+            opstamp: target_opstamp + 1,
+            target: b_term_query.weight(EnableScoring::disabled_from_schema(&schema))?,
+        });
+
+        let alive_bitset = compute_alive_bitset(&segment, &mut segment_entry, target_opstamp)?;
+        assert!(alive_bitset.is_none());
+
+        let alive_bitset = compute_alive_bitset(&segment, &mut segment_entry, target_opstamp + 1)?;
+        assert_eq!(alive_bitset.map(|alive_bitset| alive_bitset.len()), Some(0));
+
+        let mut in_memory_alive_bitset = BitSet::with_max_value_and_full(segment_meta.max_doc());
+        in_memory_alive_bitset.remove(0);
+        let mut segment_entry = SegmentEntry::new(
+            segment_meta,
+            DeleteQueue::default().cursor(),
+            Some(in_memory_alive_bitset),
+        );
+        let alive_bitset = compute_alive_bitset(&segment, &mut segment_entry, target_opstamp)?;
+        assert!(alive_bitset.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_at_delete_opstamp_applies_in_memory_deletes() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.set_merge_policy(Box::new(NoMergePolicy));
+        index_writer.add_document(doc!(text_field=>"a"))?;
+        index_writer.add_document(doc!(text_field=>"b"))?;
+        index_writer.add_document(doc!(text_field=>"c"))?;
+        index_writer.commit()?;
+        index_writer.delete_term(Term::from_field_text(text_field, "a"));
+        index_writer.commit()?;
+        index_writer.wait_merging_threads()?;
+
+        let segment_metas = index.searchable_segment_metas()?;
+        assert_eq!(segment_metas.len(), 1);
+        let segment_meta = segment_metas[0].clone();
+        let target_opstamp = index.load_metas()?.opstamp;
+        assert_eq!(segment_meta.delete_opstamp(), Some(target_opstamp));
+        assert_eq!(segment_meta.num_docs(), 2);
+        let mut alive_bitset = BitSet::with_max_value_and_full(segment_meta.max_doc());
+        alive_bitset.remove(1);
+        let segment_entry = SegmentEntry::new(
+            segment_meta,
+            DeleteQueue::default().cursor(),
+            Some(alive_bitset),
+        );
+
+        let merged_segment_entry = merge(&index, vec![segment_entry], target_opstamp)?.unwrap();
+
+        assert_eq!(merged_segment_entry.meta().num_docs(), 1);
+        Ok(())
     }
 
     #[test]

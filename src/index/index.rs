@@ -67,12 +67,15 @@ pub(crate) fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
 }
 
 /// The files owned by the given segments: one per plugin extension (the built-in
-/// extensions plus the index's required custom ones), plus each segment's delete bitset
-/// and — while it is still being written — its temp store.
+/// extensions plus the index's required custom ones), the delete bitset of a segment that has
+/// one, and the temp store of a segment that opened it.
 ///
 /// Callers pass the segment set they care about (e.g. all tracked segments for garbage
 /// collection, or just the committed ones) and the index's persisted custom extensions.
-pub(crate) fn list_segment_files(
+///
+/// It is public so that a writer outside this crate can size and garbage collect the files of
+/// its segments.
+pub fn list_segment_files(
     segment_metas: &[SegmentMeta],
     persisted_custom_extensions: &[String],
 ) -> HashSet<PathBuf> {
@@ -86,7 +89,9 @@ pub(crate) fn list_segment_files(
         for ext in &extensions {
             files.insert(segment_meta.relative_path(SegmentComponent::Custom(ext.clone())));
         }
-        files.insert(segment_meta.relative_path(SegmentComponent::Delete));
+        if segment_meta.delete_opstamp().is_some() {
+            files.insert(segment_meta.relative_path(SegmentComponent::Delete));
+        }
         if segment_meta.include_temp_store() {
             files.insert(segment_meta.relative_path(SegmentComponent::TempStore));
         }

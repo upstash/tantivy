@@ -122,36 +122,37 @@ fn compute_deleted_bitset(
     Ok(might_have_changed)
 }
 
-/// Advance delete for the given segment up to the target opstamp.
+/// Computes the alive bitset of a segment. The `.del` file of the segment and the in-memory alive
+/// bitset of the entry apply in full. The delete operations under the cursor of the entry apply
+/// up to `target_opstamp`, and the cursor advances past them. It returns `None` when the `.del`
+/// file already holds every delete.
 ///
-/// Note that there are no guarantee that the resulting `segment_entry` delete_opstamp
-/// is `==` target_opstamp.
-/// For instance, there was no delete operation between the state of the `segment_entry` and
-/// the `target_opstamp`, `segment_entry` is not updated.
-pub fn advance_deletes(
-    mut segment: Segment,
+/// Every operation under the cursor must be newer than every document of the segment, because an
+/// operation deletes every document it matches.
+pub(crate) fn compute_alive_bitset(
+    segment: &Segment,
     segment_entry: &mut SegmentEntry,
     target_opstamp: Opstamp,
-) -> crate::Result<()> {
-    if segment_entry.meta().delete_opstamp() == Some(target_opstamp) {
-        // We are already up-to-date here.
-        return Ok(());
+) -> crate::Result<Option<BitSet>> {
+    // An in-memory alive bitset can hold deletes that are newer than the `.del` file.
+    if segment_entry.alive_bitset().is_none()
+        && segment_entry.meta().delete_opstamp() == Some(target_opstamp)
+    {
+        return Ok(None);
     }
 
     if segment_entry.alive_bitset().is_none() && segment_entry.delete_cursor().get().is_none() {
         // There has been no `DeleteOperation` between the segment status and `target_opstamp`.
-        return Ok(());
+        return Ok(None);
     }
 
-    let segment_reader = SegmentReader::open(&segment)?;
+    let segment_reader = SegmentReader::open(segment)?;
 
     let max_doc = segment_reader.max_doc();
     let mut alive_bitset: BitSet = match segment_entry.alive_bitset() {
         Some(previous_alive_bitset) => (*previous_alive_bitset).clone(),
         None => BitSet::with_max_value_and_full(max_doc),
     };
-
-    let num_deleted_docs_before = segment.meta().num_deleted_docs();
 
     compute_deleted_bitset(
         &mut alive_bitset,
@@ -165,6 +166,33 @@ pub fn advance_deletes(
         alive_bitset.intersect_update(seg_alive_bitset.bitset());
     }
 
+    // `alive_bitset` is a subset of the alive set of the `.del` file, so an equal count means
+    // the file already holds every delete.
+    if alive_bitset.len() == segment_reader.num_docs() as usize {
+        return Ok(None);
+    }
+
+    Ok(Some(alive_bitset))
+}
+
+/// Advance delete for the given segment up to the target opstamp.
+///
+/// Note that there are no guarantee that the resulting `segment_entry` delete_opstamp
+/// is `==` target_opstamp.
+/// For instance, there was no delete operation between the state of the `segment_entry` and
+/// the `target_opstamp`, `segment_entry` is not updated.
+pub fn advance_deletes(
+    mut segment: Segment,
+    segment_entry: &mut SegmentEntry,
+    target_opstamp: Opstamp,
+) -> crate::Result<()> {
+    let alive_bitset = match compute_alive_bitset(&segment, segment_entry, target_opstamp)? {
+        Some(alive_bitset) => alive_bitset,
+        None => return Ok(()),
+    };
+
+    let max_doc = segment.meta().max_doc();
+    let num_deleted_docs_before = segment.meta().num_deleted_docs();
     let num_alive_docs: u32 = alive_bitset.len() as u32;
     let num_deleted_docs = max_doc - num_alive_docs;
     if num_deleted_docs > num_deleted_docs_before {
@@ -218,8 +246,6 @@ fn index_documents<D: Document>(
     let alive_bitset_opt = apply_deletes(&segment_with_max_doc, &mut delete_cursor, &doc_opstamps)?;
 
     let meta = segment_with_max_doc.meta().clone();
-    meta.untrack_temp_docstore();
-    // update segment_updater inventory to remove tempstore
     let segment_entry = SegmentEntry::new(meta, delete_cursor, alive_bitset_opt);
     segment_updater.schedule_add_segment(segment_entry).wait()?;
     Ok(())

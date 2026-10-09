@@ -1,7 +1,7 @@
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
 use crate::fastfield::FastFieldsPluginWriter;
-use crate::index::{InvertedIndexPluginWriter, Segment};
+use crate::index::{compute_initial_table_size, InvertedIndexPluginWriter, Segment};
 use crate::plugin::{PluginWriter, PluginWriterContext};
 use crate::schema::document::{Document, ErasedDocument};
 use crate::schema::Schema;
@@ -49,12 +49,24 @@ impl SegmentWriter {
     /// - segment: The segment being written
     /// - schema
     pub fn for_segment(memory_budget_in_bytes: usize, segment: Segment) -> crate::Result<Self> {
+        let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
+        Self::for_segment_with_table_size(memory_budget_in_bytes, table_size, segment)
+    }
+
+    /// Creates a new `SegmentWriter` whose term table starts with `table_size` slots, a power of
+    /// 2. The table grows as terms arrive. Custom plugins size their writers from
+    /// `memory_budget_in_bytes`.
+    pub fn for_segment_with_table_size(
+        memory_budget_in_bytes: usize,
+        table_size: usize,
+        segment: Segment,
+    ) -> crate::Result<Self> {
         let schema = segment.schema();
         let ctx = PluginWriterContext {
             segment: &segment,
             memory_budget_in_bytes,
         };
-        let inverted_index = InvertedIndexPluginWriter::new(&ctx)?;
+        let inverted_index = InvertedIndexPluginWriter::new(&ctx, table_size)?;
         let fast_fields = FastFieldsPluginWriter::new(&ctx)?;
         let store_writer = StorePluginWriter::new(&ctx)?;
         let custom_plugins = segment

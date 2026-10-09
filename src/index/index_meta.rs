@@ -37,7 +37,7 @@ impl SegmentMetaInventory {
         let inner = InnerSegmentMeta {
             segment_id,
             max_doc,
-            include_temp_doc_store: Arc::new(AtomicBool::new(true)),
+            include_temp_doc_store: Arc::new(AtomicBool::new(false)),
             deletes: None,
         };
         SegmentMeta::from(self.inventory.track(inner))
@@ -85,13 +85,12 @@ impl SegmentMeta {
         self.tracked.segment_id
     }
 
-    /// Removes the Component::TempStore from the alive list and
-    /// therefore marks the temp docstore file to be deleted by
-    /// the garbage collection.
-    pub fn untrack_temp_docstore(&self) {
+    /// Adds the Component::TempStore to the files of the segment, so that
+    /// garbage collection keeps the temp docstore while the segment is written.
+    pub(crate) fn track_temp_docstore(&self) {
         self.tracked
             .include_temp_doc_store
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Returns the number of deleted documents.
@@ -166,7 +165,7 @@ impl SegmentMeta {
             segment_id: inner_meta.segment_id,
             max_doc,
             deletes: None,
-            include_temp_doc_store: Arc::new(AtomicBool::new(true)),
+            include_temp_doc_store: Arc::new(AtomicBool::new(false)),
         });
         SegmentMeta { tracked }
     }
@@ -185,7 +184,7 @@ impl SegmentMeta {
         let tracked = self.tracked.map(move |inner_meta| InnerSegmentMeta {
             segment_id: inner_meta.segment_id,
             max_doc: inner_meta.max_doc,
-            include_temp_doc_store: Arc::new(AtomicBool::new(true)),
+            include_temp_doc_store: Arc::new(AtomicBool::new(false)),
             deletes: Some(delete_meta),
         });
         SegmentMeta { tracked }
@@ -197,8 +196,9 @@ struct InnerSegmentMeta {
     segment_id: SegmentId,
     max_doc: u32,
     pub deletes: Option<DeleteMeta>,
-    /// If you want to avoid the SegmentComponent::TempStore file to be covered by
-    /// garbage collection and deleted, set this to true. This is used during merge.
+    /// True on the meta of a segment that opened its SegmentComponent::TempStore file, which only
+    /// a segment writer with a doc id remapping does. Garbage collection keeps the file while that
+    /// meta lives.
     #[serde(skip)]
     #[serde(default = "default_temp_store")]
     pub(crate) include_temp_doc_store: Arc<AtomicBool>,
@@ -432,15 +432,20 @@ mod tests {
     use crate::store::ZstdCompressor;
     use crate::{IndexSettings, IndexSortByField, Order};
 
-    fn expected_builtin_files(segment_id: SegmentId, delete_opstamp: u64) -> HashSet<PathBuf> {
+    fn expected_builtin_files(
+        segment_id: SegmentId,
+        delete_opstamp: Option<u64>,
+    ) -> HashSet<PathBuf> {
         let segment_uuid = segment_id.uuid_string();
         let mut files = HashSet::with_capacity(7);
         for extension in ["idx", "pos", "term", "store", "fast", "fieldnorm"] {
             files.insert(PathBuf::from(format!("{segment_uuid}.{extension}")));
         }
-        files.insert(PathBuf::from(format!(
-            "{segment_uuid}.{delete_opstamp}.del"
-        )));
+        if let Some(delete_opstamp) = delete_opstamp {
+            files.insert(PathBuf::from(format!(
+                "{segment_uuid}.{delete_opstamp}.del"
+            )));
+        }
         files
     }
 
@@ -458,7 +463,6 @@ mod tests {
         let inventory = SegmentMetaInventory::default();
         let segment_id = SegmentId::generate_random();
         let segment_meta = inventory.new_segment_meta(segment_id, 10);
-        segment_meta.untrack_temp_docstore();
         // Keep another segment tracked, but absent from the metadata being listed.
         // The binding must stay alive: dropping it would untrack the segment and
         // invalidate the `inventory.all()` assertion below.
@@ -470,7 +474,7 @@ mod tests {
         // but neither index-level files nor files from other tracked segments.
         assert_eq!(
             metadata.list_segment_files(),
-            expected_builtin_files(segment_id, 0)
+            expected_builtin_files(segment_id, None)
         );
         assert_eq!(inventory.all().len(), 2);
         drop(other_segment_meta);
@@ -483,18 +487,18 @@ mod tests {
         let segment_meta = inventory.new_segment_meta(segment_id, 10);
         let mut metadata = IndexMeta::with_schema(Schema::builder().build());
         metadata.segments.push(segment_meta.clone());
-        let mut expected = expected_builtin_files(segment_id, 0);
+        assert_eq!(
+            metadata.list_segment_files(),
+            expected_builtin_files(segment_id, None)
+        );
+
+        segment_meta.track_temp_docstore();
+        let mut expected = expected_builtin_files(segment_id, None);
         expected.insert(PathBuf::from(format!(
             "{}.store.temp",
             segment_id.uuid_string()
         )));
         assert_eq!(metadata.list_segment_files(), expected);
-
-        segment_meta.untrack_temp_docstore();
-        assert_eq!(
-            metadata.list_segment_files(),
-            expected_builtin_files(segment_id, 0)
-        );
     }
 
     #[test]
@@ -505,13 +509,12 @@ mod tests {
             .new_segment_meta(segment_id, 10)
             .with_delete_meta(1, 7);
         let segment_meta = old_segment_meta.clone().with_delete_meta(2, 42);
-        segment_meta.untrack_temp_docstore();
         let mut metadata = IndexMeta::with_schema(Schema::builder().build());
         metadata.segments.push(segment_meta);
 
         assert_eq!(
             metadata.list_segment_files(),
-            expected_builtin_files(segment_id, 42)
+            expected_builtin_files(segment_id, Some(42))
         );
     }
 
@@ -525,9 +528,8 @@ mod tests {
         let mut expected = HashSet::default();
         for segment_id in segment_ids {
             let segment_meta = inventory.new_segment_meta(segment_id, 10);
-            segment_meta.untrack_temp_docstore();
             metadata.segments.push(segment_meta);
-            expected.extend(expected_builtin_files(segment_id, 0));
+            expected.extend(expected_builtin_files(segment_id, None));
             for extension in &metadata.persisted_custom_extensions {
                 expected.insert(PathBuf::from(format!(
                     "{}.{extension}",

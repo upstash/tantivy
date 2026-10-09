@@ -121,6 +121,7 @@ impl StorePluginWriter {
         let remapping_required = settings.sort_by_field.is_some() || settings.manual_doc_id_mapping;
 
         let store_writer = if remapping_required {
+            ctx.segment.meta().track_temp_docstore();
             let path = ctx.segment.relative_path(SegmentComponent::TempStore);
             let store_write = directory.open_write(&path)?;
             StoreWriter::new(

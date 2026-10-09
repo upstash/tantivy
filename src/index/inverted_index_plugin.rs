@@ -45,7 +45,7 @@ pub struct InvertedIndexPlugin;
 /// Returns the recommended initial table size as a power of 2.
 ///
 /// Note this is a very dumb way to compute log2, but it is easier to proofread that way.
-fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<usize> {
+pub(crate) fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<usize> {
     let table_memory_upper_bound = per_thread_memory_budget / 3;
     (10..20) // We cap it at 2^19 = 512K capacity.
         // TODO: There are cases where this limit causes a
@@ -147,7 +147,7 @@ pub struct InvertedIndexPluginWriter {
 }
 
 impl InvertedIndexPluginWriter {
-    pub(crate) fn new(ctx: &PluginWriterContext) -> crate::Result<Self> {
+    pub(crate) fn new(ctx: &PluginWriterContext, table_size: usize) -> crate::Result<Self> {
         let segment = ctx.segment;
         let schema = segment.schema();
         let tokenizer_manager = segment.index().tokenizers().clone();
@@ -177,7 +177,6 @@ impl InvertedIndexPluginWriter {
         let fieldnorm_path = segment.relative_path(SegmentComponent::FieldNorms);
         let fieldnorm_write = segment.index().directory().open_write(&fieldnorm_path)?;
 
-        let table_size = compute_initial_table_size(ctx.memory_budget_in_bytes)?;
         Ok(InvertedIndexPluginWriter {
             per_field_postings_writers: PerFieldPostingsWriter::for_schema(&schema),
             per_field_text_analyzers,
