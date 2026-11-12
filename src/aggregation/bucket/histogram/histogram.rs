@@ -853,7 +853,8 @@ fn intermediate_buckets_to_final_buckets_fill_gaps(
     let added_buckets = ((last_bucket_num.saturating_sub(first_bucket_num)).max(0) as u64)
         .saturating_sub(buckets.len() as u64);
     limits.add_memory_consumed(
-        added_buckets * std::mem::size_of::<IntermediateHistogramBucketEntry>() as u64,
+        added_buckets
+            .saturating_mul(std::mem::size_of::<IntermediateHistogramBucketEntry>() as u64),
     )?;
     // create buckets
     let fill_gaps_buckets = generate_buckets_with_opt_minmax(histogram_req, min_max);

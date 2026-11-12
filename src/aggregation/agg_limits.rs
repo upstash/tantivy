@@ -111,6 +111,9 @@ impl AggregationLimitsGuard {
     }
 
     pub(crate) fn add_memory_consumed(&mut self, add_num_bytes: u64) -> crate::Result<()> {
+        // Callers pass sizes computed from user input, up to u64::MAX. Rejecting such a size before
+        // it reaches the counter keeps the counter and the sum below from wrapping.
+        validate_memory_consumption(add_num_bytes, self.memory_limit)?;
         let prev_value = self
             .memory_consumption
             .fetch_add(add_num_bytes, Ordering::Relaxed);
