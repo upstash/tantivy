@@ -98,4 +98,12 @@ impl LevenshteinAutomatonBuilder {
     pub fn build_prefix_dfa(&self, query: &str) -> DFA {
         self.parametric_dfa.build_dfa(query, true)
     }
+
+    /// Builds the DFA of `build_dfa` (`prefix` false) or `build_prefix_dfa` (`prefix` true), or
+    /// returns `None` when it would take more than `max_bytes` as `DFA::memory_usage` counts them.
+    /// The build stops as soon as the next state would pass the limit.
+    pub fn build_dfa_with_limit(&self, query: &str, prefix: bool, max_bytes: usize) -> Option<DFA> {
+        self.parametric_dfa
+            .build_limited_dfa(query, prefix, false, max_bytes)
+    }
 }

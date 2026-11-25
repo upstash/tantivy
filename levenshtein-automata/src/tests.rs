@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{Distance, LevenshteinNFA, ParametricDFA};
+use crate::{Distance, LevenshteinAutomatonBuilder, LevenshteinNFA, ParametricDFA, SINK_STATE};
 
 fn make_distance(n: u8, max_distance: u8) -> Distance {
     if n > max_distance {
@@ -428,4 +428,107 @@ fn test_prefix_dfa_1_damerau() {
         "marsupial",
         Distance::Exact(1),
     );
+}
+
+fn queries() -> Vec<String> {
+    let mut queries: Vec<String> = vec![
+        "laptop",
+        "internationally",
+        "öğretmenliği",
+        "библиотека",
+        "東京大学",
+        "😀😃😄",
+        "a",
+        "ab",
+        "aaaa",
+        "abcabcaaabc",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    queries.push(
+        (0..16u32)
+            .map(|i| char::from_u32((i * 0x1000).max(0x800) + 0x100).unwrap())
+            .collect(),
+    );
+    queries.push(
+        (0x20..0x7Fu32)
+            .chain(0xA1..0x100)
+            .map(|c| char::from_u32(c).unwrap())
+            .collect(),
+    );
+    queries
+}
+
+#[test]
+fn test_matches_upstream_on_every_reachable_state() {
+    for query in queries() {
+        for distance in 0..3u8 {
+            for transposition in [false, true] {
+                let builder = LevenshteinAutomatonBuilder::new(distance, transposition);
+                let upstream_builder =
+                    upstream::LevenshteinAutomatonBuilder::new(distance, transposition);
+                for prefix in [false, true] {
+                    let (dfa, expected) = if prefix {
+                        (
+                            builder.build_prefix_dfa(&query),
+                            upstream_builder.build_prefix_dfa(&query),
+                        )
+                    } else {
+                        (
+                            builder.build_dfa(&query),
+                            upstream_builder.build_dfa(&query),
+                        )
+                    };
+                    assert_eq!(dfa.num_states(), expected.num_states());
+
+                    let start = (dfa.initial_state(), expected.initial_state());
+                    let mut visited = HashSet::new();
+                    visited.insert(start);
+                    let mut pending = vec![start];
+                    while let Some((state, expected_state)) = pending.pop() {
+                        assert_eq!(
+                            state == SINK_STATE,
+                            expected_state == upstream::SINK_STATE,
+                            "sink of {query:?} d={distance} prefix={prefix}"
+                        );
+                        assert_eq!(
+                            format!("{:?}", dfa.distance(state)),
+                            format!("{:?}", expected.distance(expected_state)),
+                            "distance of {query:?} d={distance} prefix={prefix}"
+                        );
+                        for b in 0..=255u8 {
+                            let next = (
+                                dfa.transition(state, b),
+                                expected.transition(expected_state, b),
+                            );
+                            if visited.insert(next) {
+                                pending.push(next);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_build_with_limit() {
+    let builder = LevenshteinAutomatonBuilder::new(2, true);
+    for query in queries() {
+        for prefix in [false, true] {
+            let full = builder
+                .build_dfa_with_limit(&query, prefix, usize::MAX)
+                .unwrap();
+            let at_limit = builder
+                .build_dfa_with_limit(&query, prefix, full.memory_usage())
+                .unwrap();
+            assert_eq!(at_limit.memory_usage(), full.memory_usage());
+            assert_eq!(at_limit.num_states(), full.num_states());
+            assert!(builder
+                .build_dfa_with_limit(&query, prefix, full.memory_usage() - 1)
+                .is_none());
+        }
+    }
 }

@@ -43,9 +43,22 @@ pub const SINK_STATE: u32 = 0u32;
 /// # }
 //```
 pub struct DFA {
-    transitions: Vec<[u32; 256]>,
-    distances: Vec<Distance>,
+    // Bytes that every state sends to the same next state share a class.
+    classes: [u8; 256],
+    // One row of `stride` entries per state: the next state of each class, then the encoded
+    // distance of the state. A state id is the offset of its row, so `SINK_STATE` (row 0) is 0.
+    stride: u32,
+    table: Vec<u32>,
     initial_state: u32,
+}
+
+const AT_LEAST_FLAG: u32 = 1 << 8;
+
+fn encode_distance(distance: Distance) -> u32 {
+    match distance {
+        Distance::Exact(d) => u32::from(d),
+        Distance::AtLeast(d) => AT_LEAST_FLAG | u32::from(d),
+    }
 }
 
 impl DFA {
@@ -68,17 +81,27 @@ impl DFA {
     /// Returns the Levenshtein distance associated to the
     /// current state.
     pub fn distance(&self, state_id: u32) -> Distance {
-        self.distances[state_id as usize]
+        let encoded = self.table[(state_id + self.stride - 1) as usize];
+        if encoded & AT_LEAST_FLAG != 0 {
+            Distance::AtLeast(encoded as u8)
+        } else {
+            Distance::Exact(encoded as u8)
+        }
     }
 
     /// Returns the number of states in the `DFA`.
     pub fn num_states(&self) -> usize {
-        self.transitions.len()
+        self.table.len() / self.stride as usize
     }
 
     /// Returns the destination state reached after consuming a given byte.
     pub fn transition(&self, from_state_id: u32, b: u8) -> u32 {
-        self.transitions[from_state_id as usize][b as usize]
+        self.table[(from_state_id + u32::from(self.classes[b as usize])) as usize]
+    }
+
+    /// Returns the bytes of the transition table and the class map.
+    pub fn memory_usage(&self) -> usize {
+        self.table.capacity() * 4 + self.classes.len()
     }
 }
 
@@ -94,7 +117,7 @@ impl fst::Automaton for DFA {
 
     fn is_match(&self, state: &u32) -> bool {
         match self.distance(*state) {
-            Distance::Exact(d) => true,
+            Distance::Exact(_) => true,
             Distance::AtLeast(_) => false,
         }
     }
@@ -108,11 +131,9 @@ impl fst::Automaton for DFA {
     }
 }
 
-fn fill(dest: &mut [u32], val: u32) {
-    for d in dest {
-        *d = val;
-    }
-}
+// The byte ranges `add_state` fills with one value each: 1-byte characters and continuation
+// bytes, then the lead bytes of 2-, 3- and 4-byte characters.
+const BYTE_RANGES: [(usize, usize); 4] = [(0, 192), (192, 224), (224, 240), (240, 256)];
 
 pub struct Utf8DFAStateBuilder<'a> {
     dfa_builder: &'a mut Utf8DFABuilder,
@@ -121,11 +142,8 @@ pub struct Utf8DFAStateBuilder<'a> {
 }
 
 impl<'a> Utf8DFAStateBuilder<'a> {
-    fn add_transition_id(&mut self, from_state_id: u32, b: u8, to_state_id: u32) {
-        self.dfa_builder.transitions[from_state_id as usize][b as usize] = to_state_id;
-    }
-
-    pub fn add_transition(&mut self, chr: char, to_state_id: u32) {
+    /// Returns `None` when the `DFA` would pass the builder's byte limit.
+    pub fn add_transition(&mut self, chr: char, to_state_id: u32) -> Option<()> {
         let mut buffer = [0u8; 4];
 
         // The char may translate into more than one bytes.
@@ -135,27 +153,28 @@ impl<'a> Utf8DFAStateBuilder<'a> {
         for (i, b) in bytes[..bytes.len() - 1].iter().cloned().enumerate() {
             let remaining_num_bytes = bytes.len() - i as usize - 1 as usize;
             let default_successor = self.default_successor[remaining_num_bytes];
-            let mut intermediary_state_id: u32 =
-                self.dfa_builder.transitions[from_state_id_decoded as usize][b as usize];
+            let mut intermediary_state_id: u32 = self.dfa_builder.get(from_state_id_decoded, b);
             if intermediary_state_id == default_successor {
-                intermediary_state_id = self.dfa_builder.allocate();
-                fill(
-                    &mut self.dfa_builder.transitions[intermediary_state_id as usize],
+                intermediary_state_id = self.dfa_builder.allocate()?;
+                self.dfa_builder.fill_row(
+                    intermediary_state_id,
                     self.default_successor[remaining_num_bytes - 1],
                 );
             }
-            self.add_transition_id(from_state_id_decoded, b, intermediary_state_id);
+            self.dfa_builder
+                .set(from_state_id_decoded, b, intermediary_state_id);
             from_state_id_decoded = intermediary_state_id;
         }
 
         let to_state_id_decoded = self
             .dfa_builder
-            .get_or_allocate(Utf8StateId::original(to_state_id));
-        self.add_transition_id(
+            .get_or_allocate(Utf8StateId::original(to_state_id))?;
+        self.dfa_builder.set(
             from_state_id_decoded,
             bytes[bytes.len() - 1],
             to_state_id_decoded,
         );
+        Some(())
     }
 }
 
@@ -164,10 +183,14 @@ impl<'a> Utf8DFAStateBuilder<'a> {
 /// that operates on utf-8 encoded `&[u8]`.
 pub struct Utf8DFABuilder {
     index: Vec<Option<u32>>,
-    distances: Vec<Distance>,
-    transitions: Vec<[u32; 256]>,
+    classes: [u8; 256],
+    // The classes of each of `BYTE_RANGES`.
+    range_classes: [Vec<u8>; 4],
+    stride: u32,
+    table: Vec<u32>,
+    // The `table` length the byte limit allows.
+    max_table_len: usize,
     initial_state: u32,
-    num_states: u32,
     max_num_states: u32,
 }
 
@@ -187,58 +210,123 @@ impl Utf8DFABuilder {
     /// Creates a new dictionary.
     ///
     /// The `builder` will only accept `state_id` that are
-    /// lower than `max_num_states`.
-    pub fn with_max_num_states(max_num_states: usize) -> Utf8DFABuilder {
+    /// lower than `max_num_states`. `alphabet` holds every character a transition can name.
+    /// The built `DFA` takes at most `max_bytes`.
+    pub fn new(max_num_states: usize, alphabet: &[char], max_bytes: usize) -> Utf8DFABuilder {
+        // Only `add_transition` gives a byte a value of its own: the bytes of the alphabet's
+        // characters. Every other byte keeps the value its range got in `add_state`, or the one
+        // value an intermediary or predecessor row holds for all bytes.
+        let mut is_named = [false; 256];
+        for chr in alphabet {
+            let mut buffer = [0u8; 4];
+            for &b in chr.encode_utf8(&mut buffer).as_bytes() {
+                is_named[b as usize] = true;
+            }
+        }
+        let mut classes = [0u8; 256];
+        let mut range_classes: [Vec<u8>; 4] = Default::default();
+        let mut num_classes: u32 = 0;
+        for (range_id, &(start, end)) in BYTE_RANGES.iter().enumerate() {
+            let mut range_class = None;
+            for b in start..end {
+                let class = if is_named[b] {
+                    num_classes += 1;
+                    (num_classes - 1) as u8
+                } else {
+                    match range_class {
+                        Some(class) => class,
+                        None => {
+                            num_classes += 1;
+                            range_class = Some((num_classes - 1) as u8);
+                            (num_classes - 1) as u8
+                        }
+                    }
+                };
+                classes[b] = class;
+                if !range_classes[range_id].contains(&class) {
+                    range_classes[range_id].push(class);
+                }
+            }
+        }
+
+        let stride = num_classes + 1;
+        let max_table_len = max_bytes.saturating_sub(classes.len()) / 4;
         Utf8DFABuilder {
             index: vec![None; max_num_states * 4 + 3],
-            distances: Vec::with_capacity(100),
-            transitions: Vec::with_capacity(100),
+            classes,
+            range_classes,
+            stride,
+            table: Vec::new(),
+            max_table_len: max_table_len - max_table_len % stride as usize,
             initial_state: 0u32,
-            num_states: 0u32,
             max_num_states: max_num_states as u32,
         }
     }
 
-    fn allocate(&mut self) -> u32 {
-        let new_state = self.num_states;
-        self.num_states += 1;
-        self.distances
-            .resize(new_state as usize + 1, Distance::AtLeast(255));
-        self.transitions.resize(new_state as usize + 1, [0u32; 256]);
-        new_state
+    fn get(&self, state_id: u32, b: u8) -> u32 {
+        self.table[(state_id + u32::from(self.classes[b as usize])) as usize]
     }
 
-    fn get_or_allocate(&mut self, state: Utf8StateId) -> u32 {
+    fn set(&mut self, state_id: u32, b: u8, to_state_id: u32) {
+        self.table[(state_id + u32::from(self.classes[b as usize])) as usize] = to_state_id;
+    }
+
+    fn fill_row(&mut self, state_id: u32, to_state_id: u32) {
+        let start = state_id as usize;
+        for slot in &mut self.table[start..start + self.stride as usize - 1] {
+            *slot = to_state_id;
+        }
+    }
+
+    fn allocate(&mut self) -> Option<u32> {
+        let new_state = self.table.len() as u32;
+        let new_len = self.table.len() + self.stride as usize;
+        if new_len > self.max_table_len {
+            return None;
+        }
+        if new_len > self.table.capacity() {
+            let target = (self.table.capacity() * 2)
+                .max(new_len)
+                .min(self.max_table_len);
+            self.table.reserve_exact(target - self.table.len());
+        }
+        self.table.resize(new_len, 0u32);
+        self.table[new_len - 1] = encode_distance(Distance::AtLeast(255));
+        Some(new_state)
+    }
+
+    fn get_or_allocate(&mut self, state: Utf8StateId) -> Option<u32> {
         let state_bucket = state.0 as usize;
         if let Some(state) = self.index[state_bucket] {
-            return state;
+            return Some(state);
         }
-        let new_state = self.allocate();
+        let new_state = self.allocate()?;
         self.index[state_bucket] = Some(new_state);
-        new_state
+        Some(new_state)
     }
 
-    pub fn set_initial_state(&mut self, initial_state: u32) {
-        let state_id_decoded = self.get_or_allocate(Utf8StateId::original(initial_state));
-        self.initial_state = state_id_decoded
+    pub fn set_initial_state(&mut self, initial_state: u32) -> Option<()> {
+        let state_id_decoded = self.get_or_allocate(Utf8StateId::original(initial_state))?;
+        self.initial_state = state_id_decoded;
+        Some(())
     }
 
-    /// Define a new state.
+    /// Define a new state. Returns `None` when the `DFA` would pass the byte limit.
     pub fn add_state(
         &mut self,
         state: u32,
         distance: Distance,
         default_successor_orig: u32,
-    ) -> Utf8DFAStateBuilder {
+    ) -> Option<Utf8DFAStateBuilder<'_>> {
         assert!(
             state < self.max_num_states,
             "State id is larger than max_num_states"
         );
-        let state_id = self.get_or_allocate(Utf8StateId::original(state));
-        self.distances[state_id as usize] = distance;
+        let state_id = self.get_or_allocate(Utf8StateId::original(state))?;
+        self.table[(state_id + self.stride - 1) as usize] = encode_distance(distance);
 
         let default_successor_id =
-            self.get_or_allocate(Utf8StateId::original(default_successor_orig));
+            self.get_or_allocate(Utf8StateId::original(default_successor_orig))?;
 
         // creates a chain of states of predecessors of `default_successor_orig`.
         // Accepting k-bytes (whatever the bytes are) from `predecessor_states[k-1]`
@@ -249,36 +337,32 @@ impl Utf8DFABuilder {
             for num_bytes in 1..4 {
                 let predecessor_state =
                     Utf8StateId::predecessor(default_successor_orig, num_bytes as u8);
-                let predecessor_state_id = self.get_or_allocate(predecessor_state);
+                let predecessor_state_id = self.get_or_allocate(predecessor_state)?;
                 predecessor_states[num_bytes] = predecessor_state_id;
                 let succ = predecessor_states[num_bytes - 1];
-                fill(&mut self.transitions[predecessor_state_id as usize], succ);
+                self.fill_row(predecessor_state_id, succ);
             }
         }
 
-        {
-            let transitions = &mut self.transitions[state_id as usize];
-            // 1-byte encoded chars.
-            fill(&mut transitions[0..192], predecessor_states[0]);
-            // 2-bytes encoded chars.
-            fill(&mut transitions[192..224], predecessor_states[1]);
-            // 3-bytes encoded chars.
-            fill(&mut transitions[224..240], predecessor_states[2]);
-            // 4-bytes encoded chars.
-            fill(&mut transitions[240..256], predecessor_states[3]);
+        for range_id in 0..BYTE_RANGES.len() {
+            for &class in &self.range_classes[range_id] {
+                self.table[(state_id + u32::from(class)) as usize] = predecessor_states[range_id];
+            }
         }
 
-        Utf8DFAStateBuilder {
+        Some(Utf8DFAStateBuilder {
             dfa_builder: self,
             state_id,
             default_successor: predecessor_states,
-        }
+        })
     }
 
-    pub fn build(self) -> DFA {
+    pub fn build(mut self) -> DFA {
+        self.table.shrink_to_fit();
         DFA {
-            transitions: self.transitions,
-            distances: self.distances,
+            classes: self.classes,
+            stride: self.stride,
+            table: self.table,
             initial_state: self.initial_state,
         }
     }
@@ -291,10 +375,10 @@ mod tests {
 
     #[test]
     fn test_utf8_dfa_builder() {
-        let mut dfa_builder = Utf8DFABuilder::with_max_num_states(2);
-        dfa_builder.add_state(0, Distance::Exact(1u8), 1);
-        dfa_builder.add_state(1, Distance::Exact(0u8), 0);
-        dfa_builder.set_initial_state(1u32);
+        let mut dfa_builder = Utf8DFABuilder::new(2, &[], usize::MAX);
+        dfa_builder.add_state(0, Distance::Exact(1u8), 1).unwrap();
+        dfa_builder.add_state(1, Distance::Exact(0u8), 0).unwrap();
+        dfa_builder.set_initial_state(1u32).unwrap();
         let dfa = dfa_builder.build();
         let parity_num_letters = |s: &str| dfa.eval(s).to_u8();
         assert_eq!(parity_num_letters("abcdef"), 0u8);

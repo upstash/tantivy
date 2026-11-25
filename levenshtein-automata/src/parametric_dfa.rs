@@ -135,6 +135,19 @@ impl ParametricDFA {
     /// "absolute distance" for the query but rather the distance (number of edits) which
     /// have been applied so far.
     pub fn build_custom_dfa(&self, query: &str, prefix: bool, use_applied_distance: bool) -> DFA {
+        self.build_limited_dfa(query, prefix, use_applied_distance, usize::MAX)
+            .expect("an unlimited DFA build cannot fail")
+    }
+
+    /// Builds the [DFA] of `build_custom_dfa`, or returns `None` when it would take more than
+    /// `max_bytes`.
+    pub fn build_limited_dfa(
+        &self,
+        query: &str,
+        prefix: bool,
+        use_applied_distance: bool,
+        max_bytes: usize,
+    ) -> Option<DFA> {
         let query_chars: Vec<char> = query.chars().collect();
         let query_len = query_chars.len();
         let alphabet = Alphabet::for_query_chars(&query_chars);
@@ -147,7 +160,11 @@ impl ParametricDFA {
         let initial_state_id =
             parametric_state_index.get_or_allocate(ParametricDFA::initial_state());
 
-        let mut dfa_builder = Utf8DFABuilder::with_max_num_states(max_num_states);
+        let mut alphabet_chars = Vec::new();
+        for &(chr, _) in alphabet.iter() {
+            alphabet_chars.push(chr);
+        }
+        let mut dfa_builder = Utf8DFABuilder::new(max_num_states, &alphabet_chars, max_bytes);
         let mask = (1 << self.diameter) - 1;
 
         for state_id in 0u32.. {
@@ -162,24 +179,24 @@ impl ParametricDFA {
             };
 
             if prefix && self.is_prefix_sink(state, query_len) {
-                dfa_builder.add_state(state_id, distance, state_id);
+                dfa_builder.add_state(state_id, distance, state_id)?;
             } else {
                 let default_successor = self.transition(state, 0u32).apply(state);
                 let default_successor_id =
                     parametric_state_index.get_or_allocate(default_successor);
                 let mut state_builder =
-                    dfa_builder.add_state(state_id, distance, default_successor_id);
+                    dfa_builder.add_state(state_id, distance, default_successor_id)?;
                 for &(ref chr, ref characteristic_vec) in alphabet.iter() {
                     let chi = characteristic_vec.shift_and_mask(state.offset as usize, mask);
                     let dest_state: ParametricState = self.transition(state, chi).apply(state);
                     let dest_state_id = parametric_state_index.get_or_allocate(dest_state);
-                    state_builder.add_transition(*chr, dest_state_id);
+                    state_builder.add_transition(*chr, dest_state_id)?;
                 }
             }
         }
 
-        dfa_builder.set_initial_state(initial_state_id);
-        dfa_builder.build()
+        dfa_builder.set_initial_state(initial_state_id)?;
+        Some(dfa_builder.build())
     }
 
     pub fn num_states(&self) -> usize {
