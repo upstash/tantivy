@@ -1,6 +1,7 @@
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::net::Ipv6Addr;
+use std::sync::Arc;
 
 use columnar::column_values::CompactSpaceU64Accessor;
 use columnar::{
@@ -27,6 +28,7 @@ use crate::aggregation::intermediate_agg_result::{
 use crate::aggregation::segment_agg_result::{BucketIdProvider, SegmentAggregationCollector};
 use crate::aggregation::{format_date, BucketId, Key, ValueSource};
 use crate::error::DataCorruption;
+use crate::query::RegexAutomaton;
 use crate::TantivyError;
 
 mod flattened_term_histogram;
@@ -136,7 +138,7 @@ impl TermsAggReqData {
 #[derive(Clone, Debug, PartialEq)]
 pub enum IncludeExcludeParam {
     /// A single string pattern is treated as regex.
-    Regex(String),
+    Regex(Arc<RegexAutomaton>),
     /// An array of strings is treated as exact values.
     Values(Vec<String>),
 }
@@ -145,7 +147,7 @@ impl Serialize for IncludeExcludeParam {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: serde::Serializer {
         match self {
-            IncludeExcludeParam::Regex(s) => serializer.serialize_str(s),
+            IncludeExcludeParam::Regex(automaton) => serializer.serialize_str(automaton.pattern()),
             IncludeExcludeParam::Values(v) => v.serialize(serializer),
         }
     }
@@ -167,17 +169,10 @@ impl<'de> Deserialize<'de> for IncludeExcludeParam {
 
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
             where E: de::Error {
-                Ok(IncludeExcludeParam::Regex(v.to_string()))
-            }
-
-            fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
-            where E: de::Error {
-                Ok(IncludeExcludeParam::Regex(v.to_string()))
-            }
-
-            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
-            where E: de::Error {
-                Ok(IncludeExcludeParam::Regex(v))
+                match RegexAutomaton::new(v, INCLUDE_EXCLUDE_REGEX_SIZE_LIMIT) {
+                    Ok(automaton) => Ok(IncludeExcludeParam::Regex(Arc::new(automaton))),
+                    Err(e) => Err(E::custom(format!("Invalid regex `{v}`: {e}"))),
+                }
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -193,6 +188,9 @@ impl<'de> Deserialize<'de> for IncludeExcludeParam {
         deserializer.deserialize_any(IncludeExcludeVisitor)
     }
 }
+
+/// The size limit for an include or exclude regex built by deserialization.
+pub const INCLUDE_EXCLUDE_REGEX_SIZE_LIMIT: usize = 1 << 20;
 
 /// The terms aggregation allows you to group documents by unique values of a field.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

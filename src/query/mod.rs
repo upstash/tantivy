@@ -22,6 +22,7 @@ mod phrase_query;
 mod query;
 mod query_parser;
 mod range_query;
+mod regex_automaton;
 mod regex_query;
 mod reqopt_scorer;
 mod scorer;
@@ -60,6 +61,9 @@ pub use self::phrase_query::PhraseQuery;
 pub use self::query::{EnableScoring, Query, QueryClone};
 pub use self::query_parser::{QueryParser, QueryParserError};
 pub use self::range_query::*;
+pub use self::regex_automaton::{
+    RegexAutomaton, RegexAutomatonError, RegexAutomatonQuery, RegexAutomatonState,
+};
 pub use self::regex_query::RegexQuery;
 pub use self::reqopt_scorer::RequiredOptionalScorer;
 pub use self::score_combiner::{DisjunctionMaxCombiner, ScoreCombiner, SumCombiner};

@@ -4,7 +4,6 @@ use columnar::{Column, ColumnType, StrColumn};
 use common::BitSet;
 use rustc_hash::FxHashSet;
 use serde::Serialize;
-use tantivy_fst::Regex;
 
 use crate::aggregation::accessor_helpers::{
     get_all_value_sources, get_dynamic_columns, get_missing_val_as_u64_lenient,
@@ -1104,14 +1103,11 @@ fn for_each_matching_term_ord(
     mut cb: impl FnMut(u32),
 ) -> crate::Result<()> {
     match param {
-        IncludeExcludeParam::Regex(pattern) => {
-            let re = Regex::new(pattern).map_err(|e| {
-                crate::TantivyError::InvalidArgument(format!("Invalid regex `{}`: {}", pattern, e))
-            })?;
-            // TODO: we can handle patterns like `^prefix.*` more efficiently
+        IncludeExcludeParam::Regex(automaton) => {
+            // TODO: we can handle patterns like `prefix.*` more efficiently
             let mut stream = str_col
                 .dictionary()
-                .search(re)
+                .search(automaton.as_ref())
                 .without_keys()
                 .into_stream()?;
             while stream.advance() {
